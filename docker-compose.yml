@@ -1,0 +1,30 @@
+version: "3.8"
+
+services:
+  # ── Baserow (self-hosted Airtable replacement) ──────────────────────
+  baserow:
+    image: baserow/baserow:1.29.2
+    container_name: janardan-baserow
+    ports:
+      - "80:80" # Web UI
+      - "443:443" # HTTPS (optional)
+    volumes:
+      - baserow_data:/baserow/data
+    environment:
+      - BASEROW_PUBLIC_URL=http://localhost
+    restart: unless-stopped
+  # ── Janardan App (Saree Workflow Automation) ────────────────────────
+  # Uncomment below when ready to run the app in Docker too:
+  # janardan:
+  #   build: .
+  #   container_name: janardan-app
+  #   ports:
+  #     - "8000:8000"
+  #   env_file:
+  #     - .env
+  #   depends_on:
+  #     - baserow
+  #   restart: unless-stopped
+
+volumes:
+  baserow_data:
