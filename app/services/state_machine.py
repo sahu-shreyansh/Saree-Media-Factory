@@ -44,6 +44,7 @@ class ProductStatus(str, Enum):
     FAILED_STAGE_2 = "FAILED_STAGE_2"
     FAILED_STAGE_ANGLES = "FAILED_STAGE_ANGLES"
     FAILED_STAGE_VIDEO = "FAILED_STAGE_VIDEO"
+    DEAD_LETTER = "DEAD_LETTER"
 
 
 # Valid transitions: current → [allowed targets]
@@ -65,11 +66,12 @@ VALID_TRANSITIONS: dict[str, list[str]] = {
     "APPROVED_FOR_VIDEO":   ["GENERATING_VIDEO", "FAILED_STAGE_VIDEO"],
     "GENERATING_VIDEO":     ["PUBLISHED", "FAILED_STAGE_VIDEO"],
     "PUBLISHED":            [],
-    # Recovery paths
-    "FAILED_STAGE_1":       ["Draft"],
-    "FAILED_STAGE_2":       ["MANNEQUIN_UPSCALED"],
-    "FAILED_STAGE_ANGLES":  ["APPROVED_FOR_ANGLES"],
-    "FAILED_STAGE_VIDEO":   ["APPROVED_FOR_VIDEO"],
+    # Recovery paths (auto-retry or dead-letter)
+    "FAILED_STAGE_1":       ["Draft", "DEAD_LETTER"],
+    "FAILED_STAGE_2":       ["MANNEQUIN_UPSCALED", "DEAD_LETTER"],
+    "FAILED_STAGE_ANGLES":  ["APPROVED_FOR_ANGLES", "DEAD_LETTER"],
+    "FAILED_STAGE_VIDEO":   ["APPROVED_FOR_VIDEO", "DEAD_LETTER"],
+    "DEAD_LETTER":          [],  # Terminal — manual intervention required
 }
 
 # Dispatch map: status → pipeline module name

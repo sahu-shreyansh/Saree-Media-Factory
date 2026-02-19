@@ -17,6 +17,7 @@ import re
 import httpx
 
 from app.config import get_settings
+from app.services.rate_limiter import OPENROUTER_LIMITER
 
 logger = logging.getLogger(__name__)
 
@@ -279,10 +280,11 @@ async def generate_model_image(
 
     logger.info("OpenRouter: Sending 4 images to %s (front model)...", s.OPENROUTER_MODEL)
 
-    async with httpx.AsyncClient(timeout=600) as client:
-        resp = await client.post(OPENROUTER_URL, headers=headers, json=payload)
-        resp.raise_for_status()
-        data = resp.json()
+    async with OPENROUTER_LIMITER:
+        async with httpx.AsyncClient(timeout=600) as client:
+            resp = await client.post(OPENROUTER_URL, headers=headers, json=payload)
+            resp.raise_for_status()
+            data = resp.json()
 
     return await _extract_image_from_response(data)
 
@@ -332,9 +334,10 @@ async def generate_angle_image(
 
     logger.info("OpenRouter: Generating %s angle via %s...", angle_type, s.OPENROUTER_MODEL)
 
-    async with httpx.AsyncClient(timeout=600) as client:
-        resp = await client.post(OPENROUTER_URL, headers=headers, json=payload)
-        resp.raise_for_status()
-        data = resp.json()
+    async with OPENROUTER_LIMITER:
+        async with httpx.AsyncClient(timeout=600) as client:
+            resp = await client.post(OPENROUTER_URL, headers=headers, json=payload)
+            resp.raise_for_status()
+            data = resp.json()
 
     return await _extract_image_from_response(data)

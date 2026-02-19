@@ -8,12 +8,9 @@ class Settings(BaseSettings):
     """All environment variables for the Saree Workflow Automation."""
 
     # ── Baserow ───────────────────────────────────
-    BASEROW_URL: str = "http://localhost"  # e.g. http://baserow.example.com
-    BASEROW_TOKEN: str = ""  # Database token from Baserow settings
-    BASEROW_POSTS_TABLE_ID: int = 0  # "Posts" table (Social Media Post Management)
-    BASEROW_CLIENT_HUB_TABLE_ID: int = 0  # "Posts" table (Client Content Hub)
-    BASEROW_FABRIC_ANALYSIS_TABLE_ID: int = 0  # "fabric_analysis" table
-    BASEROW_PROMPTS_TABLE_ID: int = 0  # "Prompts" table (Configuration)
+    BASEROW_URL: str = "http://localhost"
+    BASEROW_TOKEN: str = ""
+    BASEROW_POSTS_TABLE_ID: int = 0
 
     # ── Freepik Upscaler ──────────────────────────────────────────────
     FREEPIK_API_KEY: str = ""
@@ -40,6 +37,10 @@ class Settings(BaseSettings):
     API_DEBUG: bool = False
     POLL_INTERVAL_SECONDS: int = 60
     LOG_LEVEL: str = "INFO"
+
+    # ── Production settings ───────────────────────────────────────────
+    MAX_RETRIES: int = 5               # Max auto-retries before dead-letter
+    MAX_CONCURRENT_ROWS: int = 3       # Rows processed per scheduler tick
 
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8"}
 

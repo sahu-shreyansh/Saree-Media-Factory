@@ -12,6 +12,7 @@ import logging
 import httpx
 
 from app.config import get_settings
+from app.services.rate_limiter import IMGBB_LIMITER
 
 logger = logging.getLogger(__name__)
 
@@ -45,17 +46,18 @@ async def upload_image(image_data: str | bytes, name: str = "saree") -> dict:
     else:
         raise ValueError(f"Unsupported image_data type: {type(image_data)}")
 
-    async with httpx.AsyncClient(timeout=300) as client:
-        resp = await client.post(
-            IMGBB_UPLOAD_URL,
-            data={
-                "key": s.IMGBB_API_KEY,
-                "image": b64_str,
-                "name": name,
-            },
-        )
-        resp.raise_for_status()
-        data = resp.json()
+    async with IMGBB_LIMITER:
+        async with httpx.AsyncClient(timeout=300) as client:
+            resp = await client.post(
+                IMGBB_UPLOAD_URL,
+                data={
+                    "key": s.IMGBB_API_KEY,
+                    "image": b64_str,
+                    "name": name,
+                },
+            )
+            resp.raise_for_status()
+            data = resp.json()
 
     if data.get("success"):
         url = data["data"]["url"]

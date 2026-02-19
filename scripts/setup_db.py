@@ -1,25 +1,25 @@
 #!/usr/bin/env python3
-"""Automated Baserow setup — creates user, database, and all 3 tables.
+"""Automated Baserow setup — creates user, database, Posts table with clean schema.
 
 Run AFTER Baserow is running (docker compose up -d):
-    python3 scripts/setup_baserow.py
+    python3 scripts/setup_db.py
 
-This script will:
-  1. Create an admin user in Baserow
-  2. Create a "Janardan Saree Automation" workspace + database
-  3. Create 3 tables with all required fields:
-     - Posts (Social Media Post Management)
-     - Client Content Hub
-     - fabric_analysis
-  4. Generate a database API token
-  5. Print the .env values you need to set
+Modes:
+  --fresh     Create from scratch (new workspace + database + table)
+  --migrate   Update existing table: add missing fields, add missing status options,
+              delete legacy fields (interactive confirmation)
+
+This script defines the SINGLE SOURCE OF TRUTH for all Baserow fields.
 """
 
 from __future__ import annotations
 
+import argparse
 import json
+import re
 import sys
 import time
+from pathlib import Path
 
 import requests
 
@@ -29,80 +29,90 @@ BASEROW_URL = "http://localhost"
 ADMIN_EMAIL = "admin@janardan.local"
 ADMIN_PASSWORD = "JanardanAdmin123!"
 
-# ── Table schemas ─────────────────────────────────────────────────────
+# ── Canonical Schema (Single Source of Truth) ─────────────────────────
+# Only ONE table: Posts. All pipeline fields defined here.
 
-POSTS_TABLE_FIELDS = [
-    {"name": "Saree", "type": "file"},
-    {"name": "Status", "type": "single_select", "select_options": [
-        {"value": "Draft", "color": "light-gray"},
-        {"value": "MANNEQUIN_UPLOADED", "color": "light-blue"},
-        {"value": "MANNEQUIN_UPSCALED", "color": "blue"},
-        {"value": "ANALYZING_FABRIC", "color": "light-orange"},
-        {"value": "FABRIC_ANALYZED", "color": "orange"},
-        {"value": "GENERATING_MODEL", "color": "light-green"},
-        {"value": "MODEL_GENERATED", "color": "green"},
-        {"value": "Approved", "color": "dark-green"},
-        {"value": "GENERATING_VIDEO", "color": "light-cyan"},
-        {"value": "VIDEO_GENERATED", "color": "dark-cyan"},
-        {"value": "Published", "color": "dark-blue"},
-        {"value": "FAILED", "color": "dark-red"},
-    ]},
-    {"name": "ForntUpscaler", "type": "url"},
-    {"name": "CloserUpscaler", "type": "url"},
-    {"name": "BoradUpscaler", "type": "url"},
-    {"name": "PalluDesignUpscaler", "type": "url"},
-    {"name": "FRONT FULL VIEW", "type": "url"},
-    {"name": "FRONT Video URL", "type": "url"},
-    {"name": "fabric_analysis", "type": "long_text"},
-    {"name": "fabric_analysis_id", "type": "number", "number_decimal_places": 0},
+STATUS_OPTIONS = [
+    {"value": "Draft", "color": "light-gray"},
+    {"value": "MANNEQUIN_UPLOADED", "color": "light-blue"},
+    {"value": "UPSCALING_MANNEQUIN", "color": "blue"},
+    {"value": "MANNEQUIN_UPSCALED", "color": "blue"},
+    {"value": "GENERATING_MODEL", "color": "light-green"},
+    {"value": "MODEL_GENERATED", "color": "green"},
+    {"value": "UPSCALING_MODEL", "color": "green"},
+    {"value": "MODEL_UPSCALED", "color": "green"},
+    {"value": "GENERATING_HERO", "color": "light-green"},
+    {"value": "HERO_READY", "color": "dark-green"},
+    {"value": "APPROVED_FOR_ANGLES", "color": "dark-green"},
+    {"value": "GENERATING_ANGLES", "color": "light-cyan"},
+    {"value": "ANGLES_GENERATED", "color": "light-cyan"},
+    {"value": "UPSCALING_ANGLES", "color": "light-cyan"},
+    {"value": "IMAGES_READY", "color": "dark-cyan"},
+    {"value": "APPROVED_FOR_VIDEO", "color": "dark-cyan"},
+    {"value": "GENERATING_VIDEO", "color": "light-orange"},
+    {"value": "PUBLISHED", "color": "dark-blue"},
+    # Failure statuses
+    {"value": "FAILED_STAGE_1", "color": "light-red"},
+    {"value": "FAILED_STAGE_2", "color": "light-red"},
+    {"value": "FAILED_STAGE_ANGLES", "color": "light-red"},
+    {"value": "FAILED_STAGE_VIDEO", "color": "light-red"},
+    # Dead letter
+    {"value": "DEAD_LETTER", "color": "dark-red"},
 ]
 
-CLIENT_HUB_TABLE_FIELDS = [
-    {"name": "FRONT Image URL", "type": "url"},
-    {"name": "Status", "type": "single_select", "select_options": [
-        {"value": "Draft", "color": "light-gray"},
-        {"value": "Approved", "color": "dark-green"},
-        {"value": "Published", "color": "dark-blue"},
-        {"value": "FAILED", "color": "dark-red"},
-    ]},
-    {"name": "FRONT Video URL", "type": "url"},
-    {"name": "FRONT Video", "type": "long_text"},
+# All required fields for the Posts table.
+# "Name" is auto-created by Baserow as the primary field.
+POSTS_FIELDS = [
+    # ── Input files (uploaded by user) ────────────────────
+    {"name": "Saree Front", "type": "file"},
+    {"name": "Saree Closer", "type": "file"},
+    {"name": "Saree Border", "type": "file"},
+    {"name": "Saree Pallu", "type": "file"},
+
+    # ── Pipeline status ───────────────────────────────────
+    {"name": "Status", "type": "single_select", "select_options": STATUS_OPTIONS},
+    {"name": "Processing", "type": "boolean"},
+
+    # ── Stage 1: Mannequin Upscale ────────────────────────
+    {"name": "mannequin_front_upscaled", "type": "url"},
+    {"name": "mannequin_closer_upscaled", "type": "url"},
+    {"name": "mannequin_border_upscaled", "type": "url"},
+    {"name": "mannequin_pallu_upscaled", "type": "url"},
+
+    # ── Stage 2: Model Generation ─────────────────────────
+    {"name": "model_image_raw", "type": "url"},
+    {"name": "model_image_upscaled", "type": "url"},
+
+    # ── Stage 4: Angle Images ─────────────────────────────
+    {"name": "angle_side_final", "type": "url"},
+    {"name": "angle_back_final", "type": "url"},
+    {"name": "angle_closeup_final", "type": "url"},
+    {"name": "angle_movement_final", "type": "url"},
+
+    # ── Stage 5: Video ────────────────────────────────────
+    {"name": "video_url", "type": "url"},
+
+    # ── Retry / Error tracking ────────────────────────────
+    {"name": "retry_count", "type": "number", "number_decimal_places": 0},
+    {"name": "error_message", "type": "long_text"},
+    {"name": "last_error", "type": "long_text"},
+    {"name": "last_attempt_at", "type": "text"},
 ]
 
-FABRIC_ANALYSIS_TABLE_FIELDS = [
-    {"name": "product_row_id", "type": "number", "number_decimal_places": 0},
-    {"name": "dominant_colors", "type": "long_text"},
-    {"name": "weave_type", "type": "text"},
-    {"name": "thread_density_warp", "type": "number", "number_decimal_places": 1},
-    {"name": "thread_density_weft", "type": "number", "number_decimal_places": 1},
-    {"name": "pattern_type", "type": "text"},
-    {"name": "pattern_geometry", "type": "long_text"},
-    {"name": "border_width_cm", "type": "number", "number_decimal_places": 1},
-    {"name": "border_style", "type": "text"},
-    {"name": "border_motif", "type": "text"},
-    {"name": "pallu_length_cm", "type": "number", "number_decimal_places": 1},
-    {"name": "pallu_style", "type": "text"},
-    {"name": "pallu_design", "type": "text"},
-    {"name": "fabric_type", "type": "text"},
-    {"name": "transparency_level", "type": "text"},
-    {"name": "transparency_score", "type": "number", "number_decimal_places": 3},
-    {"name": "sheen_level", "type": "text"},
-    {"name": "drape_stiffness", "type": "text"},
-    {"name": "fabric_weight", "type": "text"},
-    {"name": "has_zari", "type": "boolean"},
-    {"name": "zari_type", "type": "text"},
-    {"name": "zari_coverage_percent", "type": "number", "number_decimal_places": 2},
-    {"name": "zari_areas", "type": "long_text"},
-    {"name": "topography_map_url", "type": "url"},
-    {"name": "transparency_map_url", "type": "url"},
-    {"name": "body_texture_crop_url", "type": "url"},
-    {"name": "border_crop_url", "type": "url"},
-    {"name": "pallu_crop_url", "type": "url"},
-    {"name": "single_motif_crop_url", "type": "url"},
-    {"name": "zari_detail_crop_url", "type": "url"},
-    {"name": "raw_analysis_json", "type": "long_text"},
-    {"name": "analysis_confidence", "type": "number", "number_decimal_places": 3},
-]
+# Fields that are REQUIRED — everything else in the live table is legacy junk
+REQUIRED_FIELD_NAMES = {"Name"} | {f["name"] for f in POSTS_FIELDS}
+
+# Legacy fields that should be deleted (from old V1/V2 schema)
+LEGACY_FIELDS = {
+    "ForntUpscaler", "CloserUpscaler", "BoradUpscaler", "PalluDesignUpscaler",
+    "FRONT FULL VIEW", "FRONT Video URL", "fabric_analysis", "fabric_analysis_id",
+    "Model_Image_URL", "Product_Image_URL", "Angle_Front_URL", "Angle_Close_URL",
+    "Angle_Pallu_URL", "Angle_Border_URL", "Video_URL", "Error_Log",
+    "Active_Prompt_ID", "Active",
+    "mannequin_front_raw", "mannequin_closer_raw",
+    "mannequin_border_raw", "mannequin_pallu_raw",
+    "hero_image_raw", "hero_image_final", "angle_front_final",
+}
 
 
 # ── Helpers ───────────────────────────────────────────────────────────
@@ -124,7 +134,7 @@ def wait_for_baserow(url: str, max_retries: int = 30) -> None:
     sys.exit(1)
 
 
-def api(method: str, path: str, token: str | None = None, **kwargs) -> dict:
+def api(method: str, path: str, token: str | None = None, **kwargs) -> dict | list:
     """Make an API call to Baserow."""
     url = f"{BASEROW_URL}/api{path}"
     headers = kwargs.pop("headers", {})
@@ -139,19 +149,9 @@ def api(method: str, path: str, token: str | None = None, **kwargs) -> dict:
     return resp.json() if resp.text else {}
 
 
-# ── Main setup ────────────────────────────────────────────────────────
-
-def main():
-    print("=" * 60)
-    print("  Janardan — Baserow Automated Setup")
-    print("=" * 60)
-    print()
-
-    # 1. Wait for Baserow
-    wait_for_baserow(BASEROW_URL)
-
-    # 2. Create admin user
-    print("\n📝 Creating admin user...")
+def get_auth_token() -> str:
+    """Authenticate with Baserow and return JWT token."""
+    print("\n📝 Authenticating...")
     user_resp = api("POST", "/user/", json={
         "name": "Janardan Admin",
         "email": ADMIN_EMAIL,
@@ -159,10 +159,7 @@ def main():
         "authenticate": True,
         "language": "en",
     })
-
     if not user_resp:
-        # User might already exist — try to log in
-        print("  ↳ User may already exist, trying to log in...")
         user_resp = api("POST", "/user/token-auth/", json={
             "email": ADMIN_EMAIL,
             "password": ADMIN_PASSWORD,
@@ -172,27 +169,39 @@ def main():
     if not token:
         print("❌ Failed to get auth token. Response:", user_resp)
         sys.exit(1)
-    print(f"  ✅ Authenticated (token: {token[:20]}...)")
+    print(f"  ✅ Authenticated")
+    return token
 
-    # 3. Create workspace
+
+# ── Fresh Setup ───────────────────────────────────────────────────────
+
+def cmd_fresh():
+    """Create everything from scratch."""
+    print("=" * 60)
+    print("  Janardan — Fresh Baserow Setup")
+    print("=" * 60)
+
+    wait_for_baserow(BASEROW_URL)
+    token = get_auth_token()
+
+    # Create workspace
     print("\n📁 Creating workspace...")
     workspace = api("POST", "/workspaces/", token=token, json={
         "name": "Janardan Saree Automation",
     })
     workspace_id = workspace.get("id")
     if not workspace_id:
-        # Get existing workspace
         workspaces = api("GET", "/workspaces/", token=token)
         if isinstance(workspaces, list) and workspaces:
             workspace_id = workspaces[0]["id"]
-            print(f"  ↳ Using existing workspace: {workspaces[0]['name']} (ID: {workspace_id})")
+            print(f"  ↳ Using existing workspace (ID: {workspace_id})")
         else:
             print("❌ Failed to create workspace")
             sys.exit(1)
     else:
         print(f"  ✅ Workspace created (ID: {workspace_id})")
 
-    # 4. Create database
+    # Create database
     print("\n🗄️  Creating database...")
     db = api("POST", f"/applications/workspace/{workspace_id}/", token=token, json={
         "name": "Saree Pipeline",
@@ -204,37 +213,26 @@ def main():
         sys.exit(1)
     print(f"  ✅ Database created (ID: {db_id})")
 
-    # 5. Create tables
-    table_ids = {}
-    tables_to_create = [
-        ("Posts", POSTS_TABLE_FIELDS),
-        ("Client Content Hub", CLIENT_HUB_TABLE_FIELDS),
-        ("fabric_analysis", FABRIC_ANALYSIS_TABLE_FIELDS),
-    ]
+    # Create Posts table (only table needed)
+    print("\n📊 Creating table: Posts...")
+    table = api("POST", f"/database/tables/database/{db_id}/", token=token, json={
+        "name": "Posts",
+    })
+    table_id = table.get("id")
+    if not table_id:
+        print("❌ Failed to create Posts table")
+        sys.exit(1)
+    print(f"  ✅ Posts table created (ID: {table_id})")
 
-    for table_name, fields in tables_to_create:
-        print(f"\n📊 Creating table: {table_name}...")
-        table = api("POST", f"/database/tables/database/{db_id}/", token=token, json={
-            "name": table_name,
-        })
-        table_id = table.get("id")
-        if not table_id:
-            print(f"  ❌ Failed to create table: {table_name}")
-            continue
+    # Add fields
+    for field_def in POSTS_FIELDS:
+        resp = api("POST", f"/database/fields/table/{table_id}/", token=token, json=field_def)
+        if resp.get("id"):
+            print(f"    + {field_def['name']} ({field_def['type']})")
+        else:
+            print(f"    ⚠ {field_def['name']} — creation failed")
 
-        table_ids[table_name] = table_id
-        print(f"  ✅ Table created (ID: {table_id})")
-
-        # Add fields
-        for field_def in fields:
-            field_name = field_def["name"]
-            resp = api("POST", f"/database/fields/table/{table_id}/", token=token, json=field_def)
-            if resp.get("id"):
-                print(f"    + {field_name} ({field_def['type']})")
-            else:
-                print(f"    ⚠ {field_name} — may already exist")
-
-    # 6. Create database API token
+    # Create database API token
     print("\n🔑 Creating database API token...")
     token_resp = api("POST", "/database/tokens/", token=token, json={
         "name": "janardan-pipeline",
@@ -245,19 +243,120 @@ def main():
         print("  ⚠ Could not create DB token automatically")
         db_token = "CREATE_MANUALLY_IN_BASEROW_UI"
     else:
-        # Grant permissions to all tables
-        for t_name, t_id in table_ids.items():
-            api("PATCH", f"/database/tokens/{token_resp['id']}/", token=token, json={
-                "permissions": {
-                    "create": [{"type": "table", "id": t_id}],
-                    "read": [{"type": "table", "id": t_id}],
-                    "update": [{"type": "table", "id": t_id}],
-                    "delete": [{"type": "table", "id": t_id}],
-                }
-            })
         print(f"  ✅ Token created: {db_token}")
 
-    # 7. Print results
+    _print_env_values(db_token, table_id)
+
+
+# ── Migration ─────────────────────────────────────────────────────────
+
+def cmd_migrate(table_id: int):
+    """Update existing table: add missing fields, delete legacy fields."""
+    print("=" * 60)
+    print(f"  Janardan — Migrate Posts Table (ID: {table_id})")
+    print("=" * 60)
+
+    wait_for_baserow(BASEROW_URL)
+    token = get_auth_token()
+
+    # Fetch current fields
+    print(f"\n📋 Fetching current fields for table {table_id}...")
+    fields = api("GET", f"/database/fields/table/{table_id}/", token=token)
+    if not fields:
+        print("❌ Failed to fetch fields")
+        sys.exit(1)
+
+    current_fields = {f["name"]: f for f in fields}
+    print(f"  Found {len(current_fields)} existing fields")
+
+    # ── 1. Add missing fields ─────────────────────────────
+    print("\n➕ Adding missing fields...")
+    added = 0
+    for field_def in POSTS_FIELDS:
+        if field_def["name"] not in current_fields:
+            # For single_select, don't include select_options in creation — add them separately
+            create_def = {k: v for k, v in field_def.items() if k != "select_options"}
+            resp = api("POST", f"/database/fields/table/{table_id}/", token=token, json=create_def)
+            if resp.get("id"):
+                print(f"    + {field_def['name']} ({field_def['type']})")
+                added += 1
+
+                # Add select options if needed
+                if "select_options" in field_def:
+                    _sync_select_options(resp["id"], field_def["select_options"], token)
+            else:
+                print(f"    ⚠ Failed: {field_def['name']}")
+        else:
+            # Check if Status needs new options
+            if field_def["name"] == "Status" and "select_options" in field_def:
+                status_field = current_fields["Status"]
+                _sync_select_options(status_field["id"], field_def["select_options"], token)
+
+    if added == 0:
+        print("    (all fields already exist)")
+
+    # ── 2. Delete legacy fields ───────────────────────────
+    legacy_in_table = [
+        f for name, f in current_fields.items()
+        if name in LEGACY_FIELDS
+    ]
+
+    if legacy_in_table:
+        print(f"\n🗑️  Found {len(legacy_in_table)} legacy fields to delete:")
+        for f in legacy_in_table:
+            print(f"    - {f['name']} (id={f['id']}, type={f['type']})")
+
+        answer = input("\n  Delete these legacy fields? [y/N]: ").strip().lower()
+        if answer == "y":
+            for f in legacy_in_table:
+                resp = requests.delete(
+                    f"{BASEROW_URL}/api/database/fields/{f['id']}/",
+                    headers={"Authorization": f"JWT {token}"},
+                )
+                if resp.status_code < 300:
+                    print(f"    ✅ Deleted: {f['name']}")
+                else:
+                    print(f"    ❌ Failed to delete {f['name']}: {resp.status_code}")
+        else:
+            print("    Skipped deletion.")
+    else:
+        print("\n🗑️  No legacy fields found")
+
+    # ── 3. Summary ────────────────────────────────────────
+    print("\n" + "=" * 60)
+    print("  ✅ MIGRATION COMPLETE!")
+    print("=" * 60)
+
+    # Re-fetch for verification
+    fields = api("GET", f"/database/fields/table/{table_id}/", token=token)
+    print(f"\n  Final field count: {len(fields)}")
+    print("  Required fields present:")
+    final_names = {f["name"] for f in fields}
+    for req in sorted(REQUIRED_FIELD_NAMES):
+        status = "✅" if req in final_names else "❌"
+        print(f"    {status} {req}")
+
+
+def _sync_select_options(field_id: int, desired_options: list[dict], token: str):
+    """Ensure all desired options exist in a single_select field."""
+    # Fetch current field to get existing options
+    field = api("GET", f"/database/fields/{field_id}/", token=token)
+    existing_values = {opt["value"] for opt in field.get("select_options", [])}
+
+    missing = [opt for opt in desired_options if opt["value"] not in existing_values]
+    if missing:
+        # Merge existing + missing options
+        all_opts = field.get("select_options", []) + missing
+        api("PATCH", f"/database/fields/{field_id}/", token=token, json={
+            "select_options": all_opts,
+        })
+        print(f"    + Added {len(missing)} status options: {[o['value'] for o in missing]}")
+
+
+# ── Utilities ─────────────────────────────────────────────────────────
+
+def _print_env_values(db_token: str, table_id: int):
+    """Print .env values for the user."""
     print("\n" + "=" * 60)
     print("  ✅ SETUP COMPLETE!")
     print("=" * 60)
@@ -266,43 +365,25 @@ def main():
     print()
     print(f"BASEROW_URL={BASEROW_URL}")
     print(f"BASEROW_TOKEN={db_token}")
-    print(f"BASEROW_POSTS_TABLE_ID={table_ids.get('Posts', 0)}")
-    print(f"BASEROW_CLIENT_HUB_TABLE_ID={table_ids.get('Client Content Hub', 0)}")
-    print(f"BASEROW_FABRIC_ANALYSIS_TABLE_ID={table_ids.get('fabric_analysis', 0)}")
+    print(f"BASEROW_POSTS_TABLE_ID={table_id}")
     print()
     print(f"Baserow Web UI: {BASEROW_URL}")
     print(f"Login: {ADMIN_EMAIL} / {ADMIN_PASSWORD}")
-    print()
-
-    # 8. Offer to auto-update .env
-    try:
-        answer = input("Auto-update your .env file with these values? [y/N]: ").strip().lower()
-        if answer == "y":
-            _update_env_file(db_token, table_ids)
-    except (EOFError, KeyboardInterrupt):
-        print("\nSkipped auto-update.")
 
 
-def _update_env_file(db_token: str, table_ids: dict) -> None:
+def _update_env_file(db_token: str, table_id: int) -> None:
     """Update the .env file with Baserow values."""
-    import re
-    from pathlib import Path
-
     env_path = Path(__file__).parent.parent / ".env"
     if not env_path.exists():
         print(f"  ❌ .env not found at {env_path}")
         return
 
     content = env_path.read_text()
-
     replacements = {
         "BASEROW_URL": BASEROW_URL,
         "BASEROW_TOKEN": db_token,
-        "BASEROW_POSTS_TABLE_ID": str(table_ids.get("Posts", 0)),
-        "BASEROW_CLIENT_HUB_TABLE_ID": str(table_ids.get("Client Content Hub", 0)),
-        "BASEROW_FABRIC_ANALYSIS_TABLE_ID": str(table_ids.get("fabric_analysis", 0)),
+        "BASEROW_POSTS_TABLE_ID": str(table_id),
     }
-
     for key, value in replacements.items():
         pattern = rf"^{key}=.*$"
         replacement = f"{key}={value}"
@@ -310,6 +391,27 @@ def _update_env_file(db_token: str, table_ids: dict) -> None:
 
     env_path.write_text(content)
     print(f"  ✅ .env updated at {env_path}")
+
+
+# ── CLI ───────────────────────────────────────────────────────────────
+
+def main():
+    parser = argparse.ArgumentParser(description="Janardan Baserow Setup")
+    sub = parser.add_subparsers(dest="command")
+
+    sub.add_parser("fresh", help="Create everything from scratch")
+
+    migrate_p = sub.add_parser("migrate", help="Update existing table schema")
+    migrate_p.add_argument("--table-id", type=int, required=True,
+                           help="Posts table ID to migrate")
+
+    args = parser.parse_args()
+    if args.command == "fresh":
+        cmd_fresh()
+    elif args.command == "migrate":
+        cmd_migrate(args.table_id)
+    else:
+        parser.print_help()
 
 
 if __name__ == "__main__":

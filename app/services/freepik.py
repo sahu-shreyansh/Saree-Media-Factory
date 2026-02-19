@@ -23,8 +23,10 @@ logger = logging.getLogger(__name__)
 
 BASE_URL = "https://api.freepik.com/v1/ai/image-upscaler-precision-v2"
 
-# Global semaphore: ONE concurrent Freepik request at a time
-_submit_semaphore = asyncio.Semaphore(1)
+from app.services.rate_limiter import FREEPIK_LIMITER
+
+# Use centralized rate limiter (was local _submit_semaphore)
+_submit_semaphore = FREEPIK_LIMITER
 
 
 async def submit_upscale(image_data_url: str) -> str:

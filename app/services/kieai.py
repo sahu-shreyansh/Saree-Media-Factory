@@ -15,6 +15,7 @@ import logging
 import httpx
 
 from app.config import get_settings
+from app.services.rate_limiter import KIEAI_LIMITER
 
 logger = logging.getLogger(__name__)
 
@@ -67,10 +68,11 @@ async def create_video_task(image_urls: list[str], prompt: str | None = None) ->
         },
     }
 
-    async with httpx.AsyncClient(timeout=60) as client:
-        resp = await client.post(f"{KIEAI_BASE}/createTask", headers=headers, json=body)
-        resp.raise_for_status()
-        data = resp.json()
+    async with KIEAI_LIMITER:
+        async with httpx.AsyncClient(timeout=60) as client:
+            resp = await client.post(f"{KIEAI_BASE}/createTask", headers=headers, json=body)
+            resp.raise_for_status()
+            data = resp.json()
 
     task_id = data.get("data", {}).get("taskId")
     if task_id:

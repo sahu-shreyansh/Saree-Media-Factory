@@ -1,147 +1,230 @@
-"""Janardan — Saree Workflow Automation API (V2 Stabilized).
+"""Janardan Saree Media Factory — Production-Grade FastAPI Application.
 
-Architecture:
-  scheduler tick
-    ↓
-  single dispatcher (iterate statuses in order)
-    ↓
-  exact stage by status (1 row per tick, fully serialized)
-    ↓
-  Processing lock prevents re-entry
-
-Rules:
-  - 1 row per stage per tick
-  - Processing boolean prevents double-execution
-  - Within a tick, each row dispatched at most ONCE
-  - Stages run sequentially (await, not create_task)
+Features:
+  - Dispatcher engine: deterministic stage routing via DISPATCH_MAP
+  - Auto-retry: self-healing failed stages with exponential backoff
+  - Dead-letter queue: terminal state after max retries
+  - Startup recovery: reset stuck Processing flags on boot
+  - Parallel processing: asyncio.gather for multiple rows
+  - Row locking: Processing boolean prevents double execution
+  - Centralized logging with structured transitions
 """
 
 from __future__ import annotations
 
 import asyncio
+import importlib
 import logging
-from contextlib import asynccontextmanager
-from datetime import datetime
 
-from fastapi import FastAPI
-from fastapi.responses import JSONResponse
+from contextlib import asynccontextmanager
+from fastapi import FastAPI, HTTPException
 
 from app.config import get_settings
 from app.services.baserow import db, load_status_map, STATUS_MAP
 from app.services.state_machine import DISPATCH_MAP
+from app.services import retry as retry_engine
 
-# Pipelines
-from app.pipelines import (
-    stage_1_upscale,
-    stage_2_model_gen,
-    stage_3_product_gen,
-    stage_4_angles,
-    stage_5_video,
+logger = logging.getLogger(__name__)
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Lifespan: startup + shutdown
+# ═══════════════════════════════════════════════════════════════════════
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Startup: load status map, recover stuck rows, start scheduler."""
+    s = get_settings()
+
+    # Configure logging
+    logging.basicConfig(
+        level=getattr(logging, s.LOG_LEVEL.upper(), logging.INFO),
+        format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
+        handlers=[
+            logging.StreamHandler(),
+            logging.FileHandler("app.log", mode="a", encoding="utf-8"),
+        ],
+    )
+
+    # Load Baserow status option IDs
+    await load_status_map()
+    logger.info("Status map loaded (%d statuses)", len(STATUS_MAP))
+
+    # ── Startup Recovery: reset stuck Processing flags ────────────
+    await _recover_stuck_rows(s.BASEROW_POSTS_TABLE_ID)
+
+    # Start background scheduler
+    scheduler_task = asyncio.create_task(_scheduler_loop())
+    logger.info("Pipeline scheduler started")
+
+    yield  # App running
+
+    scheduler_task.cancel()
+    try:
+        await scheduler_task
+    except asyncio.CancelledError:
+        pass
+    logger.info("Pipeline scheduler stopped")
+
+
+app = FastAPI(
+    title="Janardan Saree Media Factory",
+    version="2.0.0",
+    lifespan=lifespan,
 )
 
-# Map dispatch strings to modules
-PIPELINE_MODULES = {
-    "stage_1_upscale": stage_1_upscale,
-    "stage_2_model_gen": stage_2_model_gen,
-    "stage_3_product_gen": stage_3_product_gen,
-    "stage_4_angles": stage_4_angles,
-    "stage_5_video": stage_5_video,
-}
 
-# ── Logging ───────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════
+# Startup Recovery
+# ═══════════════════════════════════════════════════════════════════════
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s │ %(levelname)-7s │ %(name)s │ %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-)
-logger = logging.getLogger("janardan")
+async def _recover_stuck_rows(table_id: int) -> None:
+    """Reset any rows stuck with Processing=true (crashed mid-run)."""
+    try:
+        stuck = await db.search_rows(
+            table_id,
+            filters={"filter__field_5873__boolean": "1"},
+            limit=50,
+        )
+        if stuck:
+            logger.warning("Found %d stuck rows (Processing=true), resetting...", len(stuck))
+            for row in stuck:
+                await db.update_row(table_id, row["id"], {"Processing": False})
+                logger.info("  Reset Processing for row %d", row["id"])
+        else:
+            logger.info("No stuck rows found — clean startup")
+    except Exception:
+        logger.exception("Failed to recover stuck rows (non-fatal)")
 
-# ── Background scheduler ─────────────────────────────────────────────
 
-_scheduler_task: asyncio.Task | None = None
-
+# ═══════════════════════════════════════════════════════════════════════
+# Scheduler — Main dispatch loop
+# ═══════════════════════════════════════════════════════════════════════
 
 async def _scheduler_loop() -> None:
-    """Single dispatcher: one row → one stage → hard success → next.
-
-    For each status in DISPATCH_MAP (in order):
-      1. Query 1 row in that status
-      2. Skip if Processing=true (another tick is already handling it)
-      3. Skip if already dispatched this tick
-      4. Lock row (Processing=true)
-      5. Run pipeline (await — fully serialized, NOT create_task)
-      6. Unlock row (Processing=false)
-    """
+    """Continuously poll Baserow and dispatch pipeline stages."""
     s = get_settings()
-    interval = s.POLL_INTERVAL_SECONDS
-    logger.info("Scheduler started — polling every %ds", interval)
+    table_id = s.BASEROW_POSTS_TABLE_ID
+    max_concurrent = s.MAX_CONCURRENT_ROWS
 
     while True:
         try:
-            logger.info("── Scheduler tick ──")
-            dispatched_this_tick: set[int] = set()
+            # ── Phase 1: Process FAILED rows (auto-retry) ─────────
+            await _process_failed_rows(table_id)
 
+            # ── Phase 2: Dispatch normal pipeline stages ──────────
             for status, pipeline_name in DISPATCH_MAP.items():
-                pipeline_module = PIPELINE_MODULES.get(pipeline_name)
-                if not pipeline_module:
-                    continue
-
-                # Resolve text status → numeric ID for Baserow filtering
                 status_id = STATUS_MAP.get(status)
-                if status_id is None:
-                    logger.warning("Status '%s' not in STATUS_MAP, skipping", status)
+                if not status_id:
                     continue
 
-                try:
-                    rows = await db.search_rows(
-                        table_id=s.BASEROW_POSTS_TABLE_ID,
-                        filters={"filter__Status__single_select_equal": status_id},
-                        limit=1,
-                    )
-                except Exception as e:
-                    logger.error("Query '%s' failed: %s", status, e)
-                    continue
-
+                rows = await db.search_rows(
+                    table_id,
+                    filters={f"filter__field_5739__single_select_equal": status_id},
+                    limit=max_concurrent,
+                )
                 if not rows:
                     continue
 
-                row = rows[0]
-                row_id = row["id"]
-
-                # ─── Guard: already dispatched this tick ──────────
-                if row_id in dispatched_this_tick:
-                    logger.debug("Skipping row %d (already dispatched this tick)", row_id)
+                pipeline_module = _import_pipeline(pipeline_name)
+                if not pipeline_module:
                     continue
 
-                # ─── Guard: Processing lock ───────────────────────
-                if row.get("Processing"):
-                    logger.debug("Skipping row %d (Processing=true)", row_id)
+                # Filter out rows already being processed
+                eligible = [r for r in rows if not r.get("Processing")]
+                if not eligible:
                     continue
 
-                # ─── Dispatch: sequential (await, not create_task) ─
-                dispatched_this_tick.add(row_id)
                 logger.info(
-                    "Dispatching row %d (%s → %s)", row_id, status, pipeline_name
-                )
-                await _run_pipeline_task(
-                    pipeline_module, row, s.BASEROW_POSTS_TABLE_ID
+                    "Dispatching %d row(s) for %s [%s]",
+                    len(eligible), status, pipeline_name,
                 )
 
-        except Exception as exc:
-            logger.exception("Scheduler tick error: %s", exc)
+                # Run up to max_concurrent rows in parallel
+                tasks = [
+                    _run_pipeline_task(pipeline_module, row, table_id)
+                    for row in eligible
+                ]
+                await asyncio.gather(*tasks, return_exceptions=True)
 
-        await asyncio.sleep(interval)
+        except Exception:
+            logger.exception("Scheduler tick failed (will retry next cycle)")
 
+        await asyncio.sleep(s.POLL_INTERVAL_SECONDS)
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Auto-Retry Engine
+# ═══════════════════════════════════════════════════════════════════════
+
+FAILED_STATUSES = [
+    "FAILED_STAGE_1",
+    "FAILED_STAGE_2",
+    "FAILED_STAGE_ANGLES",
+    "FAILED_STAGE_VIDEO",
+]
+
+
+async def _process_failed_rows(table_id: int) -> None:
+    """Check all failed rows and retry or dead-letter them."""
+    for failed_status in FAILED_STATUSES:
+        status_id = STATUS_MAP.get(failed_status)
+        if not status_id:
+            continue
+
+        rows = await db.search_rows(
+            table_id,
+            filters={f"filter__field_5739__single_select_equal": status_id},
+            limit=10,
+        )
+        if not rows:
+            continue
+
+        for row in rows:
+            row_id = row["id"]
+            if row.get("Processing"):
+                continue
+
+            # Check if we should retry
+            if await retry_engine.should_retry(row, table_id):
+                recovery_status = retry_engine.get_recovery_status(failed_status)
+                if not recovery_status:
+                    continue
+
+                recovery_id = STATUS_MAP.get(recovery_status)
+                if not recovery_id:
+                    logger.error("Recovery status %r not in STATUS_MAP", recovery_status)
+                    continue
+
+                last_err = row.get("last_error", "") or row.get("error_message", "")
+                await retry_engine.record_attempt(row_id, table_id, str(last_err))
+
+                # Reset status to retry input state
+                await db.update_row(table_id, row_id, {"Status": recovery_id})
+                count = retry_engine._get_retry_count(row) + 1
+                logger.info(
+                    "Row %d: auto-retry #%d (%s → %s)",
+                    row_id, count, failed_status, recovery_status,
+                )
+            else:
+                # Exhausted retries → dead-letter
+                await retry_engine.dead_letter(row_id, table_id)
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Pipeline Task Execution
+# ═══════════════════════════════════════════════════════════════════════
 
 async def _run_pipeline_task(
     pipeline_module, row: dict, table_id: int
 ) -> None:
-    """Lock → run → unlock. Always clears Processing in finally."""
+    """Execute a pipeline stage with row locking."""
     row_id = row["id"]
     try:
         await db.update_row(table_id, row_id, {"Processing": True})
         await pipeline_module.run(row)
+        # On success, reset retry counter
+        await retry_engine.reset_retry(row_id, table_id)
     except Exception as e:
         logger.exception(
             "Pipeline error row %d (%s): %s", row_id, pipeline_module.__name__, e
@@ -153,68 +236,110 @@ async def _run_pipeline_task(
             logger.exception("Failed to clear Processing for row %d", row_id)
 
 
-# ── Lifespan ──────────────────────────────────────────────────────────
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    global _scheduler_task
-    # Load status option IDs BEFORE scheduler starts
-    await load_status_map()
-    logger.info("STATUS_MAP loaded: %s", STATUS_MAP)
-    _scheduler_task = asyncio.create_task(_scheduler_loop())
-    logger.info("🚀 Janardan V2 Stabilized — started")
-    yield
-    if _scheduler_task:
-        _scheduler_task.cancel()
-        logger.info("Scheduler stopped")
+def _import_pipeline(name: str):
+    """Dynamically import a pipeline module."""
+    try:
+        return importlib.import_module(f"app.pipelines.{name}")
+    except ImportError:
+        logger.error("Pipeline module not found: app.pipelines.%s", name)
+        return None
 
 
-# ── App ───────────────────────────────────────────────────────────────
-
-app = FastAPI(
-    title="Janardan — Saree Workflow Automation V2",
-    description="Production-grade Saree Media Factory Pipeline (Stabilized)",
-    version="2.2.0",
-    lifespan=lifespan,
-)
-
-
-# ── Endpoints ─────────────────────────────────────────────────────────
-
-@app.get("/")
-async def root():
-    return {
-        "name": "Janardan V2",
-        "status": "Running",
-        "pipelines": list(PIPELINE_MODULES.keys()),
-    }
-
+# ═══════════════════════════════════════════════════════════════════════
+# API Endpoints
+# ═══════════════════════════════════════════════════════════════════════
 
 @app.get("/health")
 async def health():
+    """Health check endpoint."""
     return {
         "status": "healthy",
-        "timestamp": datetime.utcnow().isoformat(),
-        "scheduler_running": _scheduler_task is not None and not _scheduler_task.done(),
+        "version": "2.0.0",
+        "features": [
+            "auto_retry",
+            "dead_letter",
+            "startup_recovery",
+            "rate_limiting",
+            "parallel_processing",
+            "watermarking",
+        ],
     }
 
 
-@app.post("/run/{stage_name}")
-async def run_stage(stage_name: str, row_id: int):
-    """Manually trigger a specific pipeline stage for a row."""
-    module = PIPELINE_MODULES.get(stage_name)
-    if not module:
-        return JSONResponse({"error": f"Unknown stage: {stage_name}"}, status_code=400)
-
+@app.post("/trigger/{row_id}/{stage}")
+async def trigger_stage(row_id: int, stage: str):
+    """Manually trigger a pipeline stage for a specific row."""
     s = get_settings()
-    try:
-        row = await db.get_row(s.BASEROW_POSTS_TABLE_ID, row_id)
-        await module.run(row)
-        return {"status": "success", "message": f"Executed {stage_name} for row {row_id}"}
-    except Exception as e:
-        logger.exception("Manual run failed: %s", e)
-        return JSONResponse({"error": str(e)}, status_code=500)
+    table_id = s.BASEROW_POSTS_TABLE_ID
 
+    pipeline_module = _import_pipeline(stage)
+    if not pipeline_module:
+        raise HTTPException(404, f"Pipeline stage not found: {stage}")
+
+    row = await db.get_row(table_id, row_id)
+    if not row:
+        raise HTTPException(404, f"Row {row_id} not found")
+
+    # Run in background
+    asyncio.create_task(_run_pipeline_task(pipeline_module, row, table_id))
+    return {"message": f"Stage '{stage}' triggered for row {row_id}"}
+
+
+@app.post("/retry-dead-letter/{row_id}")
+async def retry_dead_letter(row_id: int):
+    """Manually retry a dead-lettered row (resets retry count)."""
+    s = get_settings()
+    table_id = s.BASEROW_POSTS_TABLE_ID
+
+    row = await db.get_row(table_id, row_id)
+    if not row:
+        raise HTTPException(404, f"Row {row_id} not found")
+
+    status = _get_status_text(row)
+    if status != "DEAD_LETTER":
+        raise HTTPException(400, f"Row {row_id} is not in DEAD_LETTER (current: {status})")
+
+    # We need to know which stage failed — check error_message for the last failed stage
+    # Default to Draft (restart from beginning)
+    await retry_engine.reset_retry(row_id, table_id)
+    draft_id = STATUS_MAP.get("Draft")
+    if draft_id:
+        await db.update_row(table_id, row_id, {"Status": draft_id})
+
+    return {"message": f"Row {row_id} reset from DEAD_LETTER to Draft — will retry"}
+
+
+@app.get("/pipeline/status")
+async def pipeline_status():
+    """Get overview of all rows and their current status."""
+    s = get_settings()
+    table_id = s.BASEROW_POSTS_TABLE_ID
+
+    rows = await db.search_rows(table_id, limit=100)
+    summary = {}
+    for row in rows:
+        status = _get_status_text(row)
+        summary.setdefault(status, []).append({
+            "id": row["id"],
+            "name": row.get("Name", ""),
+            "retry_count": row.get("retry_count", 0),
+            "processing": row.get("Processing", False),
+        })
+
+    return {"total_rows": len(rows), "by_status": summary}
+
+
+def _get_status_text(row: dict) -> str:
+    """Extract status text from a row."""
+    status = row.get("Status")
+    if isinstance(status, dict):
+        return status.get("value", "Unknown")
+    return str(status) if status else "Unknown"
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Entry point
+# ═══════════════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
     import uvicorn
